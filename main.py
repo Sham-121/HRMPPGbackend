@@ -1,194 +1,132 @@
 import shutil
 import tempfile
-import os
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+import heartpy as hp
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from scipy.signal import butter, filtfilt, find_peaks
-import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from pydantic import BaseModel
 
 app = FastAPI(title="PPG Heart Rate API")
 
-# --------- CORS (so your Expo app can call this) ---------
-origins = ["*"]  # dev only; lock down in prod if you want
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # dev only; can restrict later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --------- Optional: raw PPG endpoint (values -> bpm) ---------
-
-class PpgRequest(BaseModel):
-    values: List[float] = Field(..., min_length=10)
-    fs: Optional[float] = 30.0
 
 class BpmResponse(BaseModel):
     bpm: float
     num_samples: int
-    fs: float
+    fps: float
 
-def butter_bandpass(lowcut, highcut, fs, order=4):
-    nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype="band")
-    return b, a
 
-def calculate_bpm_from_signal(values: List[float], fs: float) -> Optional[float]:
-    signal = np.array(values, dtype=float)
+# ---------- Core PPG processing ----------
 
-    # Need at least ~3 seconds of data
-    if len(signal) < fs * 3:
-        logger.warning(f"Signal too short: {len(signal)} samples at {fs} fps")
-        return None
+def extract_ppg_from_video(path: str) -> Tuple(List[float], float):
+    """Open video, extract per-frame brightness, return signal + fps."""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise HTTPException(status_code=400, detail="Could not read video file")
 
-    # Normalize
-    signal = (signal - np.mean(signal)) / (np.std(signal) + 1e-8)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0  # fallback
 
-    # Band-pass 0.7–4 Hz (~42–240 BPM)
-    b, a = butter_bandpass(0.7, 4.0, fs)
-    filtered = filtfilt(b, a, signal)
+    values: List[float] = []
+    frame_count = 0
 
-    # Peaks
-    peaks, _ = find_peaks(filtered, distance=int(0.25 * fs))  # min 0.25s apart
-    if len(peaks) < 2:
-        logger.warning(f"Not enough peaks found: {len(peaks)}")
-        return None
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    # BPM from avg RR interval
-    intervals = np.diff(peaks) / fs  # seconds
-    avg_interval = np.mean(intervals)
-    bpm = 60.0 / avg_interval
-    
-    logger.info(f"Calculated BPM: {bpm:.1f}")
-    return float(bpm)
+        frame_count += 1
 
-@app.post("/calculate_bpm", response_model=BpmResponse)
-def calculate_bpm_endpoint(req: PpgRequest):
-    logger.info(f"Received PPG request with {len(req.values)} samples at {req.fs} fps")
-    bpm = calculate_bpm_from_signal(req.values, req.fs or 30.0)
-    if bpm is None:
+        # Convert BGR -> RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, _ = frame_rgb.shape
+
+        # Take central 40% x 40% region (where finger should be)
+        x1, x2 = int(w * 0.3), int(w * 0.7)
+        y1, y2 = int(h * 0.3), int(h * 0.7)
+        roi = frame_rgb[y1:y2, x1:x2]
+
+        # Use RED channel (index 0 or 2 depending on ordering; here RGB so 0=R,1=G,2=B)
+        red = roi[:, :, 0]
+        avg_intensity = float(np.mean(red))
+        values.append(avg_intensity)
+
+    cap.release()
+
+    if len(values) < fps * 4:  # need ~4+ seconds of data
         raise HTTPException(
             status_code=422,
-            detail="Unable to compute BPM – signal too short or too noisy",
+            detail="Video too short or not enough usable frames for BPM calculation",
         )
-    return BpmResponse(bpm=round(bpm, 1), num_samples=len(req.values), fs=req.fs or 30.0)
 
-# --------- Video endpoint: upload camera clip -> BPM ---------
+    return values, float(fps)
+
+
+def calculate_bpm(values: List[float], fs: float) -> Optional[float]:
+    """Use HeartPy to get BPM from a PPG signal."""
+    signal = np.array(values, dtype=float)
+
+    # HeartPy likes at least a few seconds of data
+    if len(signal) < fs * 4:
+        return None
+
+    try:
+        working_data, measures = hp.process(signal, sample_rate=fs)
+        bpm = measures.get("bpm", None)
+        if bpm is None or not np.isfinite(bpm):
+            return None
+        return float(bpm)
+    except Exception as e:
+        print("HeartPy error:", e)
+        return None
+
+
+# ---------- API endpoints ----------
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "PPG Heart Rate API running"}
+
 
 @app.post("/analyze_ppg_video", response_model=BpmResponse)
 async def analyze_ppg_video(file: UploadFile = File(...)):
-    logger.info(f"📹 Received video upload: {file.filename} ({file.content_type})")
-    
     # Save upload to a temp file
     try:
         suffix = "." + (file.filename.split(".")[-1] if "." in file.filename else "mp4")
     except Exception:
         suffix = ".mp4"
 
-    temp_path = None
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        temp_path = tmp.name
+
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            shutil.copyfileobj(file.file, tmp)
-            temp_path = tmp.name
-        
-        logger.info(f"💾 Saved video to: {temp_path}")
-        
-        # Check file size
-        file_size = os.path.getsize(temp_path)
-        logger.info(f"📊 File size: {file_size / 1024:.2f} KB")
-
-        # Read video with OpenCV
-        cap = cv2.VideoCapture(temp_path)
-        if not cap.isOpened():
-            logger.error("❌ Could not open video file with OpenCV")
-            raise HTTPException(status_code=400, detail="Could not read video file")
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        if fps <= 0:
-            fps = 30.0  # fallback
-        
-        logger.info(f"🎬 Video properties: {frame_count} frames at {fps:.2f} fps")
-
-        values: List[float] = []
-
-        # Extract average brightness of a small central region per frame
-        frame_num = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            frame_num += 1
-            
-            # Convert to RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, _ = frame_rgb.shape
-
-            # Central crop (e.g. middle 40% x 40%)
-            x1, x2 = int(w * 0.3), int(w * 0.7)
-            y1, y2 = int(h * 0.3), int(h * 0.7)
-            roi = frame_rgb[y1:y2, x1:x2]
-
-            # Use green channel (index 1) which often gives good PPG
-            green = roi[:, :, 1]
-            avg_intensity = float(np.mean(green))
-            values.append(avg_intensity)
-
-        cap.release()
-        
-        logger.info(f"✅ Extracted {len(values)} intensity values from {frame_num} frames")
-
-        if len(values) < fps * 3:
-            logger.warning(f"⚠️ Video too short: {len(values)} samples < {fps * 3:.0f} required")
-            raise HTTPException(
-                status_code=422,
-                detail=f"Video too short: need at least 3 seconds ({fps * 3:.0f} frames at {fps:.1f} fps), got {len(values)} frames",
-            )
-
-        bpm = calculate_bpm_from_signal(values, fps)
+        values, fps = extract_ppg_from_video(temp_path)
+        bpm = calculate_bpm(values, fps)
         if bpm is None:
-            logger.error("❌ Could not calculate BPM from signal")
             raise HTTPException(
                 status_code=422,
-                detail="Unable to compute BPM – signal too noisy or unstable",
+                detail="Unable to compute BPM – signal too noisy or finger not stable",
             )
 
-        logger.info(f"🎉 Successfully calculated BPM: {bpm:.1f}")
-        return BpmResponse(bpm=round(bpm, 1), num_samples=len(values), fs=fps)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Unexpected error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        return BpmResponse(
+            bpm=round(bpm, 1),
+            num_samples=len(values),
+            fps=fps,
+        )
     finally:
-        # Clean up temp file
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.unlink(temp_path)
-                logger.info(f"🗑️ Cleaned up temp file: {temp_path}")
-            except Exception as e:
-                logger.warning(f"Could not delete temp file: {e}")
-
-@app.get("/")
-def root():
-    logger.info("Health check called")
-    return {"status": "ok", "message": "PPG Heart Rate API running"}
-
-@app.get("/health")
-def health():
-    return {"status": "healthy", "service": "PPG Heart Rate API"}
+        pass
