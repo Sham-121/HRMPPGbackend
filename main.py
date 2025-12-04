@@ -30,7 +30,7 @@ class BpmResponse(BaseModel):
 
 # ---------- Core PPG processing ----------
 
-def extract_ppg_from_video(path: str) -> Tuple(List[float], float):
+def extract_ppg_from_video(path: str) -> Tuple[List[float], float]:
     """Open video, extract per-frame brightness, return signal + fps."""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
